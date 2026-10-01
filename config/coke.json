@@ -10,7 +10,15 @@
       "max_stroke_mm": 3350.0,
       "speed_min_mm_s": 12.0,
       "speed_max_mm_s": 38.0,
-      "speed_default_mm_s": 24.0
+      "speed_default_mm_s": 24.0,
+      "profile_start_distance_mm": 300.0,
+      "profile_approach_distance_mm": 400.0,
+      "profile_start_speed_mm_s": 12.0,
+      "profile_cruise_speed_mm_s": 38.0,
+      "profile_finish_speed_mm_s": 14.0,
+      "profile_creep_speed_mm_s": 12.0,
+      "deviation_caution_band_mm": 10.0,
+      "deviation_policy": "direct_stop"
     },
     "guide": {
       "align_tolerance_mm": 15.0,

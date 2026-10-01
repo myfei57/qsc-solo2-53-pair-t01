@@ -49,11 +49,14 @@ class Api:
         add("POST", "/api/step", self._step)
         add("POST", "/api/charge", self._charge)
         add("POST", "/api/push", self._push)
+        add("POST", "/api/push/acknowledge-stop", self._acknowledge_push_stop)
+        add("POST", "/api/push/resume", self._resume_push)
         add("POST", "/api/quench", self._quench)
         add("POST", "/api/reverse", self._reverse)
         add("POST", "/api/clean", self._clean)
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/disturb", self._disturb)
+        add("POST", "/api/disturb-push", self._disturb_push)
         add("POST", "/api/concurrency", self._concurrency)
         add("POST", "/api/reset", lambda params, body: {"removed": self._platform.reset_state()})
 
@@ -150,13 +153,29 @@ class Api:
         )
 
     def _push(self, params: dict, body: dict) -> dict:
+        policy = body.get("deviation_policy")
+        crew = body.get("crew")
         return self._platform.push(
             oven=str(body.get("oven", "oven01")),
             guide_target_mm=_as_float(body, "guide_target_mm", 0.0),
             guide_measured_mm=_as_float(body, "guide_measured_mm", 0.0),
             stroke_target_mm=_as_float(body, "stroke_target_mm", self._platform.stroke.baseline_mm),
-            speed_mm_s=_as_float(body, "speed_mm_s", self._platform.config.pusher.speed_default_mm_s),
+            speed_mm_s=None if body.get("speed_mm_s") is None else _as_float(body, "speed_mm_s", 0.0),
             dt=_as_float(body, "dt", 1.0),
+            deviation_policy=None if policy is None else str(policy),
+            crew=None if crew is None else str(crew),
+        )
+
+    def _acknowledge_push_stop(self, params: dict, body: dict) -> dict:
+        return self._platform.acknowledge_push_stop(
+            op_id=str(body.get("op_id", "")),
+            operator=str(body.get("operator", "")),
+        )
+
+    def _resume_push(self, params: dict, body: dict) -> dict:
+        return self._platform.resume_push(
+            op_id=str(body.get("op_id", "")),
+            resume_token=str(body.get("resume_token", "")),
         )
 
     def _quench(self, params: dict, body: dict) -> dict:
@@ -181,6 +200,13 @@ class Api:
 
     def _disturb(self, params: dict, body: dict) -> dict:
         return self._platform.disturb_collector(_as_float(body, "delta_pa", 0.0))
+
+    def _disturb_push(self, params: dict, body: dict) -> dict:
+        after = body.get("after_mm")
+        return self._platform.disturb_push_measurement(
+            _as_float(body, "bias_mm", 0.0),
+            None if after is None else _as_float(body, "after_mm", 0.0),
+        )
 
     def _concurrency(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_probe(rounds=int(body.get("rounds", 24)))

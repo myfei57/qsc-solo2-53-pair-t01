@@ -15,14 +15,14 @@ from .audit.log import AuditLog
 from .audit.record import AuditRecord
 from .charger.machine import ChargingCar
 from .clock import Clock, SystemClock
-from .config import PlatformConfig, default_config
+from .config import PUSHER_DEVIATION_POLICIES, PlatformConfig, default_config
 from .door.latch import DoorLatch
 from .door.machine import DoorCleaner
 from .dust.damper import DustDamper
 from .dust.schedule import DamperSchedule
 from .dust.snapshot import DustSnapshot
 from .dust.system import DustSystem
-from .errors import CokeError
+from .errors import CokeError, InterlockError
 from .eventbus import Event, EventBus
 from .gas.collector import CollectorMain
 from .gas.flap import BridgeFlap
@@ -36,6 +36,8 @@ from .ids import IdFactory
 from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
 from .pusher.machine import PusherMachine
+from .pusher.recovery import PushRecovery
+from .pusher.schedule import POLICY as PUSH_ORDER_POLICY, PushSchedule
 from .pusher.speed import SpeedArbiter
 from .pusher.stroke import StrokeBaseline
 from .quench.machine import QuenchCar
@@ -79,6 +81,9 @@ class Platform:
             self.config.pusher.speed_max_mm_s,
             self.config.pusher.speed_default_mm_s,
         )
+        self.push_recovery = PushRecovery(store)
+        self.push_schedule = PushSchedule(store)
+        self._last_push_decision: dict = {}
         self.guide = GuideCar(self.config.guide)
         self.charger = ChargingCar(self.config.charger)
         self.quench_car = QuenchCar(self.config.quench)
@@ -130,6 +135,15 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        recovery = self.push_recovery.state()
+        if recovery.get("active"):
+            self.pusher.stop_hard(str(recovery.get("stop_reason", "stroke_deviation_stop")))
+            self._last_push_decision = {
+                "deviation_status": "stopped",
+                "deviation_reason": recovery.get("stop_reason", "stroke_deviation_stop"),
+                "stop_required": True,
+                "position_mm": recovery.get("stopped_position_mm"),
+            }
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -147,8 +161,7 @@ class Platform:
             detail = {
                 key: value
                 for key, value in step.get("detail", {}).items()
-                if not isinstance(value, (dict, list))
-                and key not in ("oven", "op_id", "severity", "message")
+                if key not in ("oven", "op_id", "severity", "message")
             }
             self.bus.publish(
                 Event.of(
@@ -240,33 +253,176 @@ class Platform:
         stroke_target_mm: float | None = None,
         speed_mm_s: float | None = None,
         dt: float = 1.0,
+        deviation_policy: str | None = None,
+        crew: str | None = None,
     ) -> dict:
-        """推焦编排：导焦栅对位 → 锁定 → 推焦 → 退杆；同时触发除尘联动。"""
+        """推焦编排：导焦栅对位 → 锁定 → 曲线推焦 → 退杆；同时触发除尘联动。"""
 
         with self._lock:
+            self.push_recovery.require_clear()
+            if self.pusher.is_stopped():
+                raise InterlockError("推焦杆处于停住状态，必须走人工恢复接口", component="pusher")
             op_id = self.ids.next()
             target = self.stroke.baseline_mm if stroke_target_mm is None else stroke_target_mm
-            self.speed.request("auto_cycle", speed_mm_s or self.config.pusher.speed_default_mm_s, priority=50)
-            arbitration = self.speed.resolve()
+            policy = deviation_policy or self.config.pusher.profile.deviation_policy
+            if policy not in PUSHER_DEVIATION_POLICIES:
+                raise InterlockError("推焦杆偏离策略必须是 direct_stop 或 decelerate_then_judge", component="pusher")
+            self.push_schedule.begin(oven, crew=crew)
+            if speed_mm_s is not None:
+                self.speed.request("auto_cycle", speed_mm_s, priority=50)
+                arbitration = self.speed.resolve()
+                profile_speed_cap = arbitration.speed_mm_s
+            else:
+                profile_speed_cap = None
             self.schedule.start_link(self.clock.now())
-            report = push_oven(
-                self.pusher,
-                self.guide,
-                oven,
-                guide_target_mm,
-                guide_measured_mm,
-                target,
-                arbitration.speed_mm_s,
-                dt,
+            try:
+                report = push_oven(
+                    self.pusher,
+                    self.guide,
+                    oven,
+                    guide_target_mm,
+                    guide_measured_mm,
+                    target,
+                    profile_speed_cap,
+                    dt,
+                    deviation_policy=policy,
+                )
+            except Exception:
+                self.push_schedule.fail_open(oven)
+                raise
+            stroke_position = report.get("final_forward_position_mm", self.pusher.ram_mm)
+            stroke_check = self.stroke.check(stroke_position)
+            self._last_push_decision = report.get("last_speed_decision", {})
+            report["speed_arbitration"] = (
+                {
+                    "winner": "stroke_profile",
+                    "speed_mm_s": round(self.pusher.committed_speed(), 2),
+                    "priority": 100,
+                    "contenders": 1,
+                }
+                if speed_mm_s is None
+                else arbitration.as_dict()
             )
-            stroke_check = self.stroke.check(self.pusher.ram_mm)
-            report["speed_arbitration"] = arbitration.as_dict()
             report["stroke_check"] = stroke_check
+            report["push_order_policy"] = PUSH_ORDER_POLICY
             summary = self._record_operation(op_id, "push", report)
             summary["op_id"] = op_id
+            if report.get("requires_manual_ack"):
+                stop_decision = report.get("last_speed_decision", {})
+                reason = stop_decision.get("stop_reason") or report.get("violations", ["stroke_deviation_stop"])[-1]
+                self.push_recovery.create(
+                    op_id=op_id,
+                    oven=oven,
+                    target_mm=target,
+                    dt=dt,
+                    policy=policy,
+                    position_mm=report.get("final_forward_position_mm", self.pusher.ram_mm),
+                    reason=reason,
+                )
+                self.push_schedule.fail_open(oven)
+                self.bus.publish(
+                    Event.of(
+                        "pusher",
+                        "pusher",
+                        "push_partial_failure",
+                        oven=oven,
+                        op_id=op_id,
+                        severity="alarm",
+                        message=f"推焦杆已停住：{reason}，需人工确认后恢复",
+                        reason=report.get("violations", ["stroke_deviation_stop"])[-1],
+                        stop_reason=reason,
+                        position_mm=round(self.pusher.ram_mm, 2),
+                        requires_manual_ack=True,
+                    )
+                )
+            elif report["ok"]:
+                self.push_schedule.complete(oven)
+            elif report.get("violations") == ["guide_not_aligned"]:
+                self.push_schedule.release(oven)
+            else:
+                self.push_schedule.fail_open(oven)
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def acknowledge_push_stop(self, op_id: str, operator: str) -> dict:
+        """人工确认安全停住原因，发放重新起推令牌。"""
+
+        with self._lock:
+            state = self.push_recovery.state()
+            if not state.get("active"):
+                raise InterlockError("没有待确认的推焦停住行程", component="pusher")
+            already = bool(state.get("acknowledged")) and state.get("op_id") == op_id
+            acknowledged = self.push_recovery.acknowledge(op_id, operator)
+            if not already:
+                self.bus.publish(
+                    Event.of(
+                        "pusher",
+                        "pusher",
+                        "push_stop_acknowledged",
+                        oven=acknowledged["oven"],
+                        op_id=op_id,
+                        severity="warning",
+                        message=f"{operator} 已确认推焦停住原因，允许重新起推",
+                        operator=operator,
+                        resume_token=acknowledged["resume_token"],
+                    )
+                )
+            return {"ok": True, "idempotent": already, "recovery": acknowledged}
+
+    def resume_push(self, op_id: str, resume_token: str) -> dict:
+        """按恢复令牌重新退杆并起推；同令牌重复触发不重复执行。"""
+
+        with self._lock:
+            claim = self.push_recovery.request_resume(op_id, resume_token)
+            state = claim["state"]
+            if claim["idempotent"]:
+                return {
+                    "ok": True,
+                    "idempotent": True,
+                    "recovery": state,
+                    **(state.get("last_report") or {}),
+                }
+            self.bus.publish(
+                Event.of(
+                    "pusher",
+                    "pusher",
+                    "push_resume_requested",
+                    oven=state["oven"],
+                    op_id=op_id,
+                    severity="notice",
+                    message="已按人工确认令牌重新起推",
+                    resume_token=resume_token,
+                )
+            )
+            try:
+                report = push_oven(
+                    self.pusher,
+                    self.guide,
+                    state["oven"],
+                    0.0,
+                    0.0,
+                    float(state["target_mm"]),
+                    None,
+                    float(state["dt"]),
+                    deviation_policy=state["deviation_policy"],
+                    retry=True,
+                )
+            except Exception:
+                failed = self.push_recovery.state()
+                failed["resuming"] = False
+                self.push_recovery.finish_resume(op_id, {"ok": False, "error": "resume_failed"}, False)
+                self._persist()
+                raise
+            recovery_state = self.push_recovery.finish_resume(op_id, report, report["ok"])
+            summary = self._record_operation(op_id, "push_resume", report)
+            summary["op_id"] = op_id
+            if report["ok"]:
+                self.push_schedule.complete(state["oven"])
+            else:
+                self.push_schedule.fail_open(state["oven"])
+            self._persist()
+            return {**report, **summary, "idempotent": False, "recovery": recovery_state}
 
     def quench(self, oven: str = DEFAULT_OVEN, dt: float = 1.0) -> dict:
         """熄焦编排：接焦 → 走行 → 喷淋。"""
@@ -388,6 +544,24 @@ class Platform:
         )
         return {"before_mm": before, "after_mm": after, "epoch": self.stroke.epoch}
 
+    def disturb_push_measurement(self, bias_mm: float, after_mm: float | None = None) -> dict:
+        """注入测量杆位偏差，供演练验证超差停住。"""
+
+        with self._lock:
+            if after_mm is None:
+                self.pusher.set_measurement_bias(bias_mm)
+            else:
+                def hook(_dt: float) -> None:
+                    if self.pusher.commanded_ram_mm >= float(after_mm):
+                        self.pusher.set_measurement_bias(bias_mm)
+
+                self.pusher.set_before_advance_hook(hook)
+            return {
+                "bias_mm": float(bias_mm),
+                "after_mm": None if after_mm is None else float(after_mm),
+                "measured_ram_mm": round(self.pusher.ram_mm, 2),
+            }
+
     def disturb_collector(self, delta_pa: float) -> dict:
         """模拟一次集气管扰动，返回扰动后压力。"""
 
@@ -414,9 +588,11 @@ class Platform:
     def reset_state(self) -> bool:
         """清掉落盘的平台计数（交付前重新标定用）。"""
 
-        if not self.store.exists("platform_state"):
-            return False
-        return self.store.remove("platform_state")
+        existed = self.store.exists("platform_state")
+        self.store.remove("platform_state")
+        self.store.remove("push_recovery")
+        self.store.remove("push_schedule")
+        return existed
 
     def heating_snapshot(self) -> HeatingSnapshot:
         """返回加热换向状态快照。"""
@@ -463,6 +639,10 @@ class Platform:
             "utc": self.clock.utc_iso(),
             "pusher": self.pusher.snapshot().as_dict(),
             "speed": {"committed_mm_s": round(self.speed.committed(), 2)},
+            "speed_curve": self.config.pusher.profile.as_dict() if self.config.pusher.profile else {},
+            "last_push_decision": self._last_push_decision,
+            "push_recovery": self.push_recovery.state(),
+            "push_schedule": self.push_schedule.state(),
             "stroke": {
                 "baseline_mm": self.stroke.baseline_mm,
                 "tolerance_mm": self.stroke.tolerance_mm,

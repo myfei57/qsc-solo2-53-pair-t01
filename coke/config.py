@@ -1,13 +1,14 @@
 """平台配置。
 
-配置来自 JSON 文件（标准库解析），覆盖推焦行程基线、导焦栅对齐公差、集气
-管压力带、熄焦喷淋时长、换向间隔、炉温确认带、除尘挡板联动参数与存储目录。
-任何缺失或越界取值都在装配阶段抛出 :class:`ConfigError`，不允许带着半份
-配置启动控制链。
+配置来自 JSON 文件（标准库解析），覆盖推焦行程基线与分段速度曲线、导焦栅
+对齐公差、集气管压力带、熄焦喷淋时长、换向间隔、炉温确认带、除尘挡板联动
+参数与存储目录。任何缺失或越界取值都在装配阶段抛出 :class:`ConfigError`，
+不允许带着半份配置启动控制链。
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from typing import Any, Mapping
 from .errors import ConfigError
 
 _MISSING = object()
+PUSHER_DEVIATION_POLICIES = ("direct_stop", "decelerate_then_judge")
 
 
 def _section(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
@@ -39,6 +41,71 @@ def _number(section: Mapping[str, Any], key: str, *, minimum: float | None = Non
     return number
 
 
+def _optional_number(section: Mapping[str, Any], key: str, default: float) -> float:
+    if key not in section:
+        return float(default)
+    return _number(section, key)
+
+
+@dataclass(frozen=True)
+class PusherProfile:
+    """按行程分段的推焦速度曲线与超差判定策略。"""
+
+    start_distance_mm: float
+    approach_distance_mm: float
+    start_speed_mm_s: float
+    cruise_speed_mm_s: float
+    finish_speed_mm_s: float
+    creep_speed_mm_s: float
+    caution_band_mm: float
+    deviation_policy: str
+
+    @classmethod
+    def from_mapping(cls, limits: "PusherLimits", section: Mapping[str, Any] | None = None) -> "PusherProfile":
+        values = section if isinstance(section, Mapping) else {}
+        profile = cls(
+            start_distance_mm=_optional_number(values, "profile_start_distance_mm", 300.0),
+            approach_distance_mm=_optional_number(values, "profile_approach_distance_mm", 400.0),
+            start_speed_mm_s=_optional_number(values, "profile_start_speed_mm_s", limits.speed_min_mm_s),
+            cruise_speed_mm_s=_optional_number(values, "profile_cruise_speed_mm_s", limits.speed_max_mm_s),
+            finish_speed_mm_s=_optional_number(values, "profile_finish_speed_mm_s", 14.0),
+            creep_speed_mm_s=_optional_number(values, "profile_creep_speed_mm_s", limits.speed_min_mm_s),
+            caution_band_mm=_optional_number(values, "deviation_caution_band_mm", 10.0),
+            deviation_policy=str(values.get("deviation_policy", "direct_stop")),
+        )
+        if profile.start_distance_mm <= 0.0 or profile.approach_distance_mm <= 0.0:
+            raise ConfigError("推焦起步段和收速段距离必须为正", component="config")
+        if profile.start_distance_mm + profile.approach_distance_mm >= limits.stroke_baseline_mm:
+            raise ConfigError("推焦速度曲线的起步段与收速段不得占满基线行程", component="config")
+        for key in ("start_speed_mm_s", "cruise_speed_mm_s", "finish_speed_mm_s", "creep_speed_mm_s"):
+            value = getattr(profile, key)
+            if not limits.speed_min_mm_s <= value <= limits.speed_max_mm_s:
+                raise ConfigError(f"推焦曲线速度 {key} 必须落在速度上下限之间", component="config")
+        if not profile.start_speed_mm_s < profile.cruise_speed_mm_s:
+            raise ConfigError("推焦起步速度必须低于中段速度", component="config")
+        if not profile.finish_speed_mm_s < profile.cruise_speed_mm_s:
+            raise ConfigError("推焦末段收速必须低于中段速度", component="config")
+        if profile.creep_speed_mm_s > profile.finish_speed_mm_s:
+            raise ConfigError("超差复查爬行速度不得高于末段收速", component="config")
+        if profile.caution_band_mm <= 0.0 or profile.caution_band_mm > limits.stroke_tolerance_mm:
+            raise ConfigError("超差预警带必须为正且不大于行程公差", component="config")
+        if profile.deviation_policy not in PUSHER_DEVIATION_POLICIES:
+            raise ConfigError("推焦杆超差策略必须是 direct_stop 或 decelerate_then_judge", component="config")
+        return profile
+
+    def as_dict(self) -> dict:
+        return {
+            "profile_start_distance_mm": self.start_distance_mm,
+            "profile_approach_distance_mm": self.approach_distance_mm,
+            "profile_start_speed_mm_s": self.start_speed_mm_s,
+            "profile_cruise_speed_mm_s": self.cruise_speed_mm_s,
+            "profile_finish_speed_mm_s": self.finish_speed_mm_s,
+            "profile_creep_speed_mm_s": self.creep_speed_mm_s,
+            "deviation_caution_band_mm": self.caution_band_mm,
+            "deviation_policy": self.deviation_policy,
+        }
+
+
 @dataclass(frozen=True)
 class PusherLimits:
     """推焦机行程与速度约束。"""
@@ -49,6 +116,7 @@ class PusherLimits:
     speed_min_mm_s: float
     speed_max_mm_s: float
     speed_default_mm_s: float
+    profile: PusherProfile | None = None
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "PusherLimits":
@@ -66,7 +134,8 @@ class PusherLimits:
             raise ConfigError("推焦速度下限必须小于上限", component="config")
         if not limits.speed_min_mm_s <= limits.speed_default_mm_s <= limits.speed_max_mm_s:
             raise ConfigError("推焦默认速度必须落在速度上下限之间", component="config")
-        return limits
+        profile = PusherProfile.from_mapping(limits, section)
+        return dataclasses.replace(limits, profile=profile)
 
 
 @dataclass(frozen=True)
@@ -267,10 +336,12 @@ def load_config(path: str) -> PlatformConfig:
 def default_config() -> PlatformConfig:
     """内置默认配置，供未指定配置文件时装配使用。"""
 
+    default_limits = PusherLimits(3200.0, 25.0, 3350.0, 12.0, 38.0, 24.0)
+    default_profile = PusherProfile.from_mapping(default_limits, {})
     return PlatformConfig(
         name="sequence-control",
         storage_root="var/state",
-        pusher=PusherLimits(3200.0, 25.0, 3350.0, 12.0, 38.0, 24.0),
+        pusher=dataclasses.replace(default_limits, profile=default_profile),
         guide=GuideLimits(15.0, 120.0, 20.0),
         charger=ChargerLimits(20.0, 28.0, 4.0),
         quench=QuenchLimits(42.0, 1.6, 90.0, 320.0),
@@ -294,6 +365,7 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "speed_min_mm_s": cfg.pusher.speed_min_mm_s,
                 "speed_max_mm_s": cfg.pusher.speed_max_mm_s,
                 "speed_default_mm_s": cfg.pusher.speed_default_mm_s,
+                **(cfg.pusher.profile.as_dict() if cfg.pusher.profile else {}),
             },
             "guide": {
                 "align_tolerance_mm": cfg.guide.align_tolerance_mm,
