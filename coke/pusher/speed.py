@@ -49,6 +49,11 @@ class SpeedArbiter:
         clamped = max(self._min, min(self._max, float(speed_mm_s)))
         self._requests[writer] = (clamped, int(priority), self._seq)
 
+    def reset(self) -> None:
+        """清空各路速度请求，供一次新的受控起推重新仲裁。"""
+
+        self._requests.clear()
+
     def resolve(self) -> SpeedOutcome:
         """收敛所有请求，返回并记录唯一提交值。"""
 

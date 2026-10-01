@@ -49,9 +49,24 @@ class PusherLimits:
     speed_min_mm_s: float
     speed_max_mm_s: float
     speed_default_mm_s: float
+    creep_start_ratio: float
+    accel_ratio: float
+    decel_ratio: float
+    creep_end_ratio: float
+    creep_start_speed_mm_s: float
+    cruise_speed_mm_s: float
+    creep_end_speed_mm_s: float
+    warning_deviation_mm: float
+    hard_deviation_mm: float
+    reduced_speed_mm_s: float
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "PusherLimits":
+        def optional_number(key: str, default: float) -> float:
+            if key not in section:
+                return default
+            return _number(section, key, minimum=0.0)
+
         limits = cls(
             stroke_baseline_mm=_number(section, "stroke_baseline_mm", minimum=0.0),
             stroke_tolerance_mm=_number(section, "stroke_tolerance_mm", minimum=0.0),
@@ -59,6 +74,16 @@ class PusherLimits:
             speed_min_mm_s=_number(section, "speed_min_mm_s", minimum=0.0),
             speed_max_mm_s=_number(section, "speed_max_mm_s", minimum=0.1),
             speed_default_mm_s=_number(section, "speed_default_mm_s", minimum=0.1),
+            creep_start_ratio=optional_number("creep_start_ratio", 0.05),
+            accel_ratio=optional_number("accel_ratio", 0.15),
+            decel_ratio=optional_number("decel_ratio", 0.20),
+            creep_end_ratio=optional_number("creep_end_ratio", 0.10),
+            creep_start_speed_mm_s=optional_number("creep_start_speed_mm_s", 14.0),
+            cruise_speed_mm_s=optional_number("cruise_speed_mm_s", 36.0),
+            creep_end_speed_mm_s=optional_number("creep_end_speed_mm_s", 14.0),
+            warning_deviation_mm=optional_number("warning_deviation_mm", 15.0),
+            hard_deviation_mm=optional_number("hard_deviation_mm", 30.0),
+            reduced_speed_mm_s=optional_number("reduced_speed_mm_s", 12.0),
         )
         if limits.stroke_baseline_mm > limits.max_stroke_mm:
             raise ConfigError("推焦行程基线不得超过最大行程", component="config")
@@ -66,6 +91,26 @@ class PusherLimits:
             raise ConfigError("推焦速度下限必须小于上限", component="config")
         if not limits.speed_min_mm_s <= limits.speed_default_mm_s <= limits.speed_max_mm_s:
             raise ConfigError("推焦默认速度必须落在速度上下限之间", component="config")
+        ratio_sum = (
+            limits.creep_start_ratio
+            + limits.accel_ratio
+            + limits.decel_ratio
+            + limits.creep_end_ratio
+        )
+        if not 0.0 < ratio_sum < 1.0:
+            raise ConfigError("推焦速度曲线分段比例之和必须位于 0 和 1 之间", component="config")
+        for key in ("creep_start_speed_mm_s", "cruise_speed_mm_s", "creep_end_speed_mm_s"):
+            value = getattr(limits, key)
+            if not limits.speed_min_mm_s <= value <= limits.speed_max_mm_s:
+                raise ConfigError(f"{key} 必须落在推焦速度上下限之间", component="config")
+        if limits.cruise_speed_mm_s <= limits.creep_start_speed_mm_s:
+            raise ConfigError("中段快推速度必须高于起步缓行速度", component="config")
+        if limits.cruise_speed_mm_s <= limits.creep_end_speed_mm_s:
+            raise ConfigError("中段快推速度必须高于末端缓行速度", component="config")
+        if not 0.0 < limits.warning_deviation_mm < limits.hard_deviation_mm:
+            raise ConfigError("偏离预警限值必须为正且小于硬停限值", component="config")
+        if not 0.0 <= limits.reduced_speed_mm_s <= limits.speed_max_mm_s:
+            raise ConfigError("偏离降速观察速度必须位于速度上下限之间", component="config")
         return limits
 
 
@@ -270,7 +315,24 @@ def default_config() -> PlatformConfig:
     return PlatformConfig(
         name="sequence-control",
         storage_root="var/state",
-        pusher=PusherLimits(3200.0, 25.0, 3350.0, 12.0, 38.0, 24.0),
+        pusher=PusherLimits(
+            stroke_baseline_mm=3200.0,
+            stroke_tolerance_mm=25.0,
+            max_stroke_mm=3350.0,
+            speed_min_mm_s=12.0,
+            speed_max_mm_s=38.0,
+            speed_default_mm_s=24.0,
+            creep_start_ratio=0.05,
+            accel_ratio=0.15,
+            decel_ratio=0.20,
+            creep_end_ratio=0.10,
+            creep_start_speed_mm_s=14.0,
+            cruise_speed_mm_s=36.0,
+            creep_end_speed_mm_s=14.0,
+            warning_deviation_mm=15.0,
+            hard_deviation_mm=30.0,
+            reduced_speed_mm_s=12.0,
+        ),
         guide=GuideLimits(15.0, 120.0, 20.0),
         charger=ChargerLimits(20.0, 28.0, 4.0),
         quench=QuenchLimits(42.0, 1.6, 90.0, 320.0),
@@ -294,6 +356,16 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "speed_min_mm_s": cfg.pusher.speed_min_mm_s,
                 "speed_max_mm_s": cfg.pusher.speed_max_mm_s,
                 "speed_default_mm_s": cfg.pusher.speed_default_mm_s,
+                "creep_start_ratio": cfg.pusher.creep_start_ratio,
+                "accel_ratio": cfg.pusher.accel_ratio,
+                "decel_ratio": cfg.pusher.decel_ratio,
+                "creep_end_ratio": cfg.pusher.creep_end_ratio,
+                "creep_start_speed_mm_s": cfg.pusher.creep_start_speed_mm_s,
+                "cruise_speed_mm_s": cfg.pusher.cruise_speed_mm_s,
+                "creep_end_speed_mm_s": cfg.pusher.creep_end_speed_mm_s,
+                "warning_deviation_mm": cfg.pusher.warning_deviation_mm,
+                "hard_deviation_mm": cfg.pusher.hard_deviation_mm,
+                "reduced_speed_mm_s": cfg.pusher.reduced_speed_mm_s,
             },
             "guide": {
                 "align_tolerance_mm": cfg.guide.align_tolerance_mm,

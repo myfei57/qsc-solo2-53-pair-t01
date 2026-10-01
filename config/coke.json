@@ -10,7 +10,17 @@
       "max_stroke_mm": 3350.0,
       "speed_min_mm_s": 12.0,
       "speed_max_mm_s": 38.0,
-      "speed_default_mm_s": 24.0
+      "speed_default_mm_s": 24.0,
+      "creep_start_ratio": 0.05,
+      "accel_ratio": 0.15,
+      "decel_ratio": 0.20,
+      "creep_end_ratio": 0.10,
+      "creep_start_speed_mm_s": 14.0,
+      "cruise_speed_mm_s": 36.0,
+      "creep_end_speed_mm_s": 14.0,
+      "warning_deviation_mm": 15.0,
+      "hard_deviation_mm": 30.0,
+      "reduced_speed_mm_s": 12.0
     },
     "guide": {
       "align_tolerance_mm": 15.0,

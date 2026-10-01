@@ -20,6 +20,13 @@ def _as_float(body: dict, key: str, default: float) -> float:
         raise CokeError(f"参数 {key!r} 必须是数值", component="console") from error
 
 
+def _as_str(body: dict, key: str, default: str = "") -> str:
+    value = body.get(key, default)
+    if value is None:
+        return default
+    return str(value)
+
+
 class Api:
     """把 HTTP 请求翻译成平台调用。"""
 
@@ -49,6 +56,10 @@ class Api:
         add("POST", "/api/step", self._step)
         add("POST", "/api/charge", self._charge)
         add("POST", "/api/push", self._push)
+        add("POST", "/api/push/order", self._push_order)
+        add("POST", "/api/push/batch", self._push_batch)
+        add("POST", "/api/push/confirm-resume", self._confirm_push_resume)
+        add("POST", "/api/push/resume", self._resume_push)
         add("POST", "/api/quench", self._quench)
         add("POST", "/api/reverse", self._reverse)
         add("POST", "/api/clean", self._clean)
@@ -150,13 +161,48 @@ class Api:
         )
 
     def _push(self, params: dict, body: dict) -> dict:
+        stroke_target = None if body.get("stroke_target_mm") is None else _as_float(body, "stroke_target_mm", 0.0)
+        speed = None if body.get("speed_mm_s") is None else _as_float(body, "speed_mm_s", 0.0)
         return self._platform.push(
-            oven=str(body.get("oven", "oven01")),
+            oven=_as_str(body, "oven", "oven01"),
             guide_target_mm=_as_float(body, "guide_target_mm", 0.0),
             guide_measured_mm=_as_float(body, "guide_measured_mm", 0.0),
-            stroke_target_mm=_as_float(body, "stroke_target_mm", self._platform.stroke.baseline_mm),
-            speed_mm_s=_as_float(body, "speed_mm_s", self._platform.config.pusher.speed_default_mm_s),
+            stroke_target_mm=stroke_target,
+            speed_mm_s=speed,
             dt=_as_float(body, "dt", 1.0),
+            furnace_condition=_as_str(body, "furnace_condition", "normal"),
+            deviation_policy=None if not body.get("deviation_policy") else _as_str(body, "deviation_policy"),
+            crew=_as_str(body, "crew"),
+        )
+
+    def _push_order(self, params: dict, body: dict) -> dict:
+        raw_ovens = body.get("ovens", [])
+        if not isinstance(raw_ovens, list) or not raw_ovens:
+            raise CokeError("参数 'ovens' 必须是非空数组", component="console")
+        return self._platform.push_order_plan([str(item) for item in raw_ovens], crew=_as_str(body, "crew"))
+
+    def _push_batch(self, params: dict, body: dict) -> dict:
+        raw_ovens = body.get("ovens", [])
+        if not isinstance(raw_ovens, list) or not raw_ovens:
+            raise CokeError("参数 'ovens' 必须是非空数组", component="console")
+        return self._platform.push_batch(
+            [str(item) for item in raw_ovens], crew=_as_str(body, "crew"), dt=_as_float(body, "dt", 1.0)
+        )
+
+    def _confirm_push_resume(self, params: dict, body: dict) -> dict:
+        return self._platform.confirm_push_resume(
+            incident_id=_as_str(body, "incident_id"),
+            confirmed_by=_as_str(body, "confirmed_by"),
+        )
+
+    def _resume_push(self, params: dict, body: dict) -> dict:
+        condition = body.get("furnace_condition")
+        policy = body.get("deviation_policy")
+        return self._platform.resume_push(
+            incident_id=_as_str(body, "incident_id"),
+            dt=_as_float(body, "dt", 1.0),
+            furnace_condition=None if condition is None else str(condition),
+            deviation_policy=None if policy is None else str(policy),
         )
 
     def _quench(self, params: dict, body: dict) -> dict:

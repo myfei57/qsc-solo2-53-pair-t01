@@ -22,7 +22,7 @@ from .dust.damper import DustDamper
 from .dust.schedule import DamperSchedule
 from .dust.snapshot import DustSnapshot
 from .dust.system import DustSystem
-from .errors import CokeError
+from .errors import CokeError, InterlockError
 from .eventbus import Event, EventBus
 from .gas.collector import CollectorMain
 from .gas.flap import BridgeFlap
@@ -35,7 +35,11 @@ from .heating.valvetrain import ValveTrain
 from .ids import IdFactory
 from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
+from .pusher.curve import SpeedCurve
+from .pusher.guard import DIRECT_STOP, REDUCE_THEN_JUDGE, TravelGuard
 from .pusher.machine import PusherMachine
+from .pusher.recovery import PushRecovery
+from .pusher.schedule import OVEN_ORDER, PushSchedule
 from .pusher.speed import SpeedArbiter
 from .pusher.stroke import StrokeBaseline
 from .quench.machine import QuenchCar
@@ -46,6 +50,13 @@ from .telemetry import TrendBuffer
 
 DEFAULT_UNIT = "battery1"
 DEFAULT_OVEN = "oven01"
+DEVIATION_POLICIES = {
+    "normal": REDUCE_THEN_JUDGE,
+    "sticky": DIRECT_STOP,
+    "loose": DIRECT_STOP,
+    "difficult_coke": DIRECT_STOP,
+    "easy_coke": REDUCE_THEN_JUDGE,
+}
 
 
 class Platform:
@@ -79,6 +90,31 @@ class Platform:
             self.config.pusher.speed_max_mm_s,
             self.config.pusher.speed_default_mm_s,
         )
+        limits = self.config.pusher
+        self.speed_curve = SpeedCurve(
+            baseline_mm=limits.stroke_baseline_mm,
+            creep_start_ratio=limits.creep_start_ratio,
+            accel_ratio=limits.accel_ratio,
+            decel_ratio=limits.decel_ratio,
+            creep_end_ratio=limits.creep_end_ratio,
+            creep_start_speed_mm_s=limits.creep_start_speed_mm_s,
+            cruise_speed_mm_s=limits.cruise_speed_mm_s,
+            creep_end_speed_mm_s=limits.creep_end_speed_mm_s,
+            min_speed_mm_s=limits.speed_min_mm_s,
+            max_speed_mm_s=limits.speed_max_mm_s,
+        )
+        self.travel_guard = TravelGuard(
+            baseline_mm=limits.stroke_baseline_mm,
+            baseline_tolerance_mm=limits.stroke_tolerance_mm,
+            warning_deviation_mm=limits.warning_deviation_mm,
+            hard_deviation_mm=limits.hard_deviation_mm,
+            reduced_speed_mm_s=limits.reduced_speed_mm_s,
+        )
+        self.recovery = PushRecovery()
+        self.push_schedule = PushSchedule()
+        self._measurement_offset_mm = 0.0
+        self._last_speed_decision: dict = {}
+        self._last_deviation_decision: dict = {}
         self.guide = GuideCar(self.config.guide)
         self.charger = ChargingCar(self.config.charger)
         self.quench_car = QuenchCar(self.config.quench)
@@ -139,16 +175,85 @@ class Platform:
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
 
+    def _deviation_policy(self, furnace_condition: str, deviation_policy: str | None) -> str:
+        if deviation_policy is not None:
+            if deviation_policy not in (DIRECT_STOP, REDUCE_THEN_JUDGE):
+                raise CokeError(f"未知偏离策略 {deviation_policy!r}", component="pusher")
+            return deviation_policy
+        return DEVIATION_POLICIES.get(furnace_condition, REDUCE_THEN_JUDGE)
+
+    def _measured_position(self, measured_mm: float, _target_mm: float) -> float:
+        return float(measured_mm) + self._measurement_offset_mm
+
+    def _speed_curve_for(self, baseline_mm: float) -> SpeedCurve:
+        limits = self.config.pusher
+        return SpeedCurve(
+            baseline_mm=float(baseline_mm),
+            creep_start_ratio=limits.creep_start_ratio,
+            accel_ratio=limits.accel_ratio,
+            decel_ratio=limits.decel_ratio,
+            creep_end_ratio=limits.creep_end_ratio,
+            creep_start_speed_mm_s=limits.creep_start_speed_mm_s,
+            cruise_speed_mm_s=limits.cruise_speed_mm_s,
+            creep_end_speed_mm_s=limits.creep_end_speed_mm_s,
+            min_speed_mm_s=limits.speed_min_mm_s,
+            max_speed_mm_s=limits.speed_max_mm_s,
+        )
+
+    def _record_hold_if_needed(
+        self,
+        op_id: str,
+        oven: str,
+        report: dict,
+        policy: str,
+        furnace_condition: str,
+        target_mm: float,
+    ) -> dict | None:
+        if not report.get("ok") and self.pusher.is_held():
+            decision = report.get("deviation_decision") or {}
+            incident = self.recovery.open_incident(
+                oven,
+                op_id,
+                {
+                    **decision,
+                    "target_mm": target_mm,
+                    "policy": policy,
+                    "furnace_condition": furnace_condition,
+                },
+            )
+            self.pusher.hold(self.pusher.hold_reason(), incident.incident_id)
+            payload = {**incident.as_dict(), "decision": report.get("deviation_decision") or {}}
+            self.bus.publish(
+                Event.of(
+                    "pusher",
+                    "pusher",
+                    "push_held",
+                    oven=oven,
+                    op_id=op_id,
+                    severity="warning",
+                    message=incident.reason,
+                    **{
+                        key: value
+                        for key, value in payload.items()
+                        if key not in ("oven", "op_id") and not isinstance(value, (dict, list))
+                    },
+                )
+            )
+            return incident.as_dict()
+        return None
+
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
 
         oven = str(report.get("oven", ""))
         for step in report.get("steps", []):
+            raw_detail = step.get("detail", {})
+            severity = str(raw_detail.get("severity", "notice"))
             detail = {
                 key: value
-                for key, value in step.get("detail", {}).items()
+                for key, value in raw_detail.items()
                 if not isinstance(value, (dict, list))
-                and key not in ("oven", "op_id", "severity", "message")
+                and key not in ("oven", "op_id", "action", "severity", "message")
             }
             self.bus.publish(
                 Event.of(
@@ -157,7 +262,7 @@ class Platform:
                     step["action"],
                     oven=oven,
                     op_id=op_id,
-                    severity="notice",
+                    severity=severity,
                     **detail,
                 )
             )
@@ -180,6 +285,8 @@ class Platform:
             "oven": oven,
             "ok": bool(report.get("ok")),
             "violations": list(report.get("violations", [])),
+            "start_push_order": report.get("start_push_order"),
+            "crew": report.get("crew", ""),
         }
         self.bus.publish(
             Event.of(
@@ -240,14 +347,37 @@ class Platform:
         stroke_target_mm: float | None = None,
         speed_mm_s: float | None = None,
         dt: float = 1.0,
+        *,
+        furnace_condition: str = "normal",
+        deviation_policy: str | None = None,
+        measurement_offset_mm: float = 0.0,
+        crew: str = "",
     ) -> dict:
-        """推焦编排：导焦栅对位 → 锁定 → 推焦 → 退杆；同时触发除尘联动。"""
+        """推焦编排：导焦栅对位 → 锁定 → 分段速度推焦 → 退杆；同时触发除尘联动。"""
 
         with self._lock:
+            if self.pusher.is_held():
+                active = self.recovery.active_incident()
+                incident_id = active.incident_id if active else self.pusher.hold_incident_id()
+                raise CokeError(
+                    f"推焦杆处于安全保持（事件 {incident_id}），必须人工确认后调用恢复接口",
+                    component="pusher",
+                )
             op_id = self.ids.next()
             target = self.stroke.baseline_mm if stroke_target_mm is None else stroke_target_mm
-            self.speed.request("auto_cycle", speed_mm_s or self.config.pusher.speed_default_mm_s, priority=50)
+            if abs(target - self.stroke.baseline_mm) > self.stroke.tolerance_mm:
+                raise CokeError(
+                    f"推焦目标 {target} 偏离基线 {self.stroke.baseline_mm} 超过公差，拒绝起推",
+                    component="pusher",
+                )
+            policy = self._deviation_policy(furnace_condition, deviation_policy)
+            self._measurement_offset_mm = float(measurement_offset_mm)
+            initial_speed = self.speed_curve.evaluate(0.0).speed_mm_s
+            requested_speed = initial_speed if speed_mm_s is None else speed_mm_s
+            self.speed.reset()
+            self.speed.request("auto_cycle", requested_speed, priority=50)
             arbitration = self.speed.resolve()
+            self.pusher.set_speed(arbitration.speed_mm_s)
             self.schedule.start_link(self.clock.now())
             report = push_oven(
                 self.pusher,
@@ -258,15 +388,187 @@ class Platform:
                 target,
                 arbitration.speed_mm_s,
                 dt,
+                speed_curve=self._speed_curve_for(target),
+                guard=self.travel_guard,
+                deviation_policy=policy,
+                furnace_condition=furnace_condition,
+                on_measurement=self._measured_position,
             )
             stroke_check = self.stroke.check(self.pusher.ram_mm)
             report["speed_arbitration"] = arbitration.as_dict()
             report["stroke_check"] = stroke_check
+            report["deviation_policy"] = policy
+            report["furnace_condition"] = furnace_condition
+            report["start_push_order"] = OVEN_ORDER
+            report["crew"] = str(crew)
+            self._last_speed_decision = report.get("speed_curve_decision") or {}
+            self._last_deviation_decision = report.get("deviation_decision") or {}
+            report["hold_incident"] = self._record_hold_if_needed(
+                op_id, oven, report, policy, furnace_condition, target
+            )
             summary = self._record_operation(op_id, "push", report)
             summary["op_id"] = op_id
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def confirm_push_resume(self, incident_id: str, confirmed_by: str) -> dict:
+        """人工确认安全保持事件，允许下一步重新起推。"""
+
+        with self._lock:
+            active = self.recovery.active_incident()
+            if active is not None and active.incident_id == incident_id:
+                existing = self.recovery.get_confirmation(incident_id)
+                if existing is not None and existing.confirmed_by == str(confirmed_by).strip():
+                    return existing.as_dict()
+            try:
+                confirmation = self.recovery.confirm(incident_id, confirmed_by)
+            except KeyError as error:
+                raise CokeError(str(error.args[0]), component="pusher") from error
+            except ValueError as error:
+                raise InterlockError(str(error), component="pusher") from error
+            self.bus.publish(
+                Event.of(
+                    "pusher",
+                    "pusher",
+                    "push_resume_confirmed",
+                    severity="notice",
+                    message=f"{confirmation.confirmed_by} 已确认允许恢复推焦",
+                    **confirmation.as_dict(),
+                )
+            )
+            return confirmation.as_dict()
+
+    def resume_push(
+        self,
+        incident_id: str,
+        dt: float = 1.0,
+        *,
+        furnace_condition: str | None = None,
+        deviation_policy: str | None = None,
+        measurement_offset_mm: float | None = None,
+    ) -> dict:
+        """幂等执行一次重新起推；同一保持事件重复调用返回首次结果。"""
+
+        with self._lock:
+            cached = self.recovery.get_result(incident_id)
+            if cached is not None:
+                return cached
+            try:
+                active = self.recovery.active_incident()
+                if active is None or active.incident_id != incident_id:
+                    raise KeyError(f"未找到活动保持事件 {incident_id!r}")
+                confirmation = self.recovery.get_confirmation(incident_id)
+                if confirmation is None:
+                    raise InterlockError("重新起推前必须有人确认", component="pusher")
+                if not self.recovery.start_resume(incident_id):
+                    raise InterlockError("恢复动作已在执行，重复触发被忽略", component="pusher")
+            except KeyError as error:
+                raise CokeError(str(error.args[0]), component="pusher") from error
+
+            condition = active.furnace_condition if furnace_condition is None else furnace_condition
+            policy = self._deviation_policy(condition, deviation_policy)
+            if measurement_offset_mm is None:
+                self._measurement_offset_mm = 0.0
+            else:
+                self._measurement_offset_mm = float(measurement_offset_mm)
+            self.pusher.confirm_resume()
+            op_id = self.ids.next()
+            self.bus.publish(
+                Event.of(
+                    "pusher",
+                    "pusher",
+                    "push_resume_started",
+                    oven=active.oven,
+                    op_id=op_id,
+                    severity="notice",
+                    message="人工确认后重新起推",
+                    **{
+                        f"confirmation_{key}": value
+                        for key, value in confirmation.as_dict().items()
+                    },
+                    **{
+                        f"incident_{key}": value
+                        for key, value in active.as_dict().items()
+                        if key not in ("oven", "op_id") and not isinstance(value, (dict, list))
+                    },
+                )
+            )
+            report = push_oven(
+                self.pusher,
+                self.guide,
+                active.oven,
+                0.0,
+                0.0,
+                active.target_mm,
+                self.speed_curve.evaluate(self.pusher.ram_mm).speed_mm_s,
+                dt,
+                speed_curve=self._speed_curve_for(active.target_mm),
+                guard=self.travel_guard,
+                deviation_policy=policy,
+                furnace_condition=condition,
+                on_measurement=self._measured_position,
+                resume=True,
+            )
+            report["deviation_policy"] = policy
+            report["furnace_condition"] = condition
+            self._last_speed_decision = report.get("speed_curve_decision") or {}
+            self._last_deviation_decision = report.get("deviation_decision") or {}
+            report["confirmation"] = confirmation.as_dict()
+            report["hold_incident"] = self._record_hold_if_needed(
+                op_id, active.oven, report, policy, condition, active.target_mm
+            )
+            summary = self._record_operation(op_id, "push_resume", report)
+            summary["op_id"] = op_id
+            result = {**report, **summary}
+            self.recovery.finish_resume(incident_id, confirmation, result)
+            if result.get("ok"):
+                self._operations += 1
+                self._persist()
+            return result
+
+    def push_order_plan(self, ovens: list[str], crew: str = "") -> dict:
+        """按固定炉号升序生成起推计划；班组只记录，不参与排序。"""
+
+        with self._lock:
+            plan = self.push_schedule.plan(ovens, crew=crew)
+            self.bus.publish(
+                Event.of(
+                    "pusher",
+                    "pusher",
+                    "push_order_planned",
+                    severity="notice",
+                    message=plan["reason"],
+                    start_push_order=plan["start_push_order"],
+                    crew=plan["crew"],
+                    oven_count=len(plan["ovens"]),
+                    oven_order=",".join(plan["ovens"]),
+                )
+            )
+            return plan
+
+    def push_batch(self, ovens: list[str], crew: str = "", dt: float = 1.0) -> dict:
+        """按固定炉号顺序连续起推，任一炉部分失败即停止后续炉号。"""
+
+        with self._lock:
+            plan = self.push_order_plan(list(ovens), crew=crew)
+            results = []
+            for oven in plan["ovens"]:
+                report = self.push(
+                    oven=oven,
+                    guide_target_mm=0.0,
+                    guide_measured_mm=0.0,
+                    dt=dt,
+                    crew=crew,
+                )
+                results.append({"oven": oven, "ok": report.get("ok"), "violations": report.get("violations", [])})
+                if not report.get("ok"):
+                    break
+            return {
+                "ok": all(item["ok"] for item in results) and len(results) == len(plan["ovens"]),
+                "plan": plan,
+                "results": results,
+            }
 
     def quench(self, oven: str = DEFAULT_OVEN, dt: float = 1.0) -> dict:
         """熄焦编排：接焦 → 走行 → 喷淋。"""
@@ -375,6 +677,8 @@ class Platform:
             raise CokeError("标定值必须为正", component="pusher")
         before = self.stroke.baseline_mm
         after = self.stroke.calibrate(value_mm)
+        self.travel_guard.calibrate(after)
+        self.speed_curve = self._speed_curve_for(after)
         self.bus.publish(
             Event.of(
                 "pusher",
@@ -462,7 +766,19 @@ class Platform:
             "now": round(self.clock.now(), 3),
             "utc": self.clock.utc_iso(),
             "pusher": self.pusher.snapshot().as_dict(),
-            "speed": {"committed_mm_s": round(self.speed.committed(), 2)},
+            "speed": {
+                "committed_mm_s": round(self.speed.committed(), 2),
+                "curve": self.speed_curve.as_dict(),
+                "last_decision": self._last_speed_decision,
+            },
+            "deviation_guard": {
+                "warning_limit_mm": self.config.pusher.warning_deviation_mm,
+                "hard_limit_mm": self.config.pusher.hard_deviation_mm,
+                "reduced_speed_mm_s": self.config.pusher.reduced_speed_mm_s,
+                "last_decision": self._last_deviation_decision,
+            },
+            "push_recovery": self.recovery.status(),
+            "push_order": {"start_push_order": OVEN_ORDER, "crew_order_ignored": True},
             "stroke": {
                 "baseline_mm": self.stroke.baseline_mm,
                 "tolerance_mm": self.stroke.tolerance_mm,
